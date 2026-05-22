@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 /// Run the host mode: connect to signaling server, create a room,
@@ -189,8 +189,20 @@ async fn peer_handler(
     }
 
     // 4. Create per-peer stream manager and TCP connection manager
-    let mut stream_mgr = StreamManager::new(Instant::now());
+    let stream_mgr = Arc::new(Mutex::new(StreamManager::new(Instant::now())));
     let tcp_mgr = Arc::new(TcpConnectionManager::new());
+
+    // Shared state for current ACK numbers (stream_id -> ack_num)
+    let current_acks: Arc<Mutex<HashMap<u16, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Generate a random connection ID (use system time as fallback)
+    let connection_id = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    };
 
     // 5. Main packet processing loop
     let mut next_ping = Instant::now();
@@ -209,14 +221,21 @@ async fn peer_handler(
                 match maybe_pkt {
                     Ok(Some(pkt)) => {
                         let now = Instant::now();
-                        stream_mgr.last_activity = now;
+                        {
+                            let mut mgr = stream_mgr.lock().await;
+                            mgr.last_activity = now;
+                        }
 
                         if pkt.has_flag(FLAG_SYN) {
-                            let sid = stream_mgr.accept_syn(pkt.stream_id, pkt.seq_num, now);
+                            let sid = {
+                                let mut mgr = stream_mgr.lock().await;
+                                mgr.accept_syn(pkt.stream_id, pkt.seq_num, now)
+                            };
                             tracing::info!(stream = sid, "incoming SYN, connecting to target");
 
                             let ack = Packet {
                                 flags: FLAG_ACK,
+                                connection_id: 0,
                                 stream_id: sid,
                                 seq_num: 0,
                                 ack_num: pkt.seq_num.wrapping_add(1),
@@ -227,23 +246,41 @@ async fn peer_handler(
                             let target = target_addr.clone();
                             let udp_sock = socket.clone();
                             let tcp_mgr_clone = tcp_mgr.clone();
+                            let acks_clone = current_acks.clone();
+                            let stream_mgr_clone = stream_mgr.clone();
+                            let conn_id = connection_id;
                             tokio::spawn(async move {
-                                tcp_mgr_clone.handle_syn(sid, target, udp_sock, peer_udp).await;
+                                tcp_mgr_clone.handle_syn(sid, target, udp_sock, peer_udp, acks_clone, stream_mgr_clone, conn_id).await;
                             });
                         } else if pkt.has_flag(FLAG_DATA) {
-                            stream_mgr.on_data(pkt.stream_id, pkt.seq_num);
-                            stream_mgr.on_ack(pkt.stream_id, pkt.ack_num);
+                            // Process data and get payloads to deliver in order
+                            let (payloads, ack_num) = {
+                                let mut mgr = stream_mgr.lock().await;
+                                let payloads = mgr.on_data(pkt.stream_id, pkt.seq_num, pkt.payload.clone());
+                                mgr.on_ack(pkt.stream_id, pkt.ack_num);
+                                let ack_num = mgr.current_ack(pkt.stream_id);
+                                (payloads, ack_num)
+                            };
+
+                            // Update shared ACK state for the TCP connection manager
+                            current_acks.lock().await.insert(pkt.stream_id, ack_num);
 
                             let writers = tcp_mgr.writers();
                             let w = writers.lock().await;
                             if let Some(tx) = w.get(&pkt.stream_id) {
-                                let _ = tx.send(pkt.payload.clone());
+                                for payload in payloads {
+                                    let _ = tx.send(payload);
+                                }
                             } else {
-                                tcp_mgr.buffer_data(pkt.stream_id, pkt.payload.clone()).await;
+                                // TCP connection not ready yet - buffer all payloads
+                                for payload in payloads {
+                                    tcp_mgr.buffer_data(pkt.stream_id, payload).await;
+                                }
                             }
                         } else if pkt.has_flag(FLAG_PING) {
                             let pong = Packet {
                                 flags: FLAG_PONG,
+                                connection_id: 0,
                                 stream_id: packet::CONTROL_STREAM,
                                 seq_num: 0,
                                 ack_num: 0,
@@ -251,13 +288,13 @@ async fn peer_handler(
                             };
                             let _ = socket.send_to(&pong.encode(), peer_udp).await;
                         } else if pkt.has_flag(FLAG_PONG) {
-                            stream_mgr.on_pong();
+                            stream_mgr.lock().await.on_pong();
                         } else if pkt.has_flag(FLAG_FIN) {
                             tracing::info!(stream = pkt.stream_id, "FIN received");
-                            stream_mgr.remove(pkt.stream_id);
+                            stream_mgr.lock().await.remove(pkt.stream_id);
                         } else if pkt.has_flag(FLAG_RST) {
                             tracing::info!(stream = pkt.stream_id, "RST received");
-                            stream_mgr.remove(pkt.stream_id);
+                            stream_mgr.lock().await.remove(pkt.stream_id);
                         }
                     }
                     Ok(None) => {
@@ -274,27 +311,41 @@ async fn peer_handler(
         // Keepalive (non-blocking, checked every ~50ms)
         let now = Instant::now();
         if now >= next_ping {
-            if stream_mgr.should_send_ping(now) {
-                let pkt = Packet {
-                    flags: FLAG_PING,
-                    stream_id: packet::CONTROL_STREAM,
-                    seq_num: 0,
-                    ack_num: 0,
-                    payload: vec![],
-                };
-                let _ = socket.send_to(&pkt.encode(), peer_udp).await;
-                stream_mgr.mark_ping_sent(now);
-            }
-            if stream_mgr.keepalive_failed() {
-                tracing::error!(peer = %peer_udp, "keepalive failed, disconnecting");
-                break;
+            let should_ping = {
+                let mut mgr = stream_mgr.lock().await;
+                if mgr.should_send_ping(now) {
+                    let pkt = Packet {
+                        flags: FLAG_PING,
+                        connection_id: 0,
+                        stream_id: packet::CONTROL_STREAM,
+                        seq_num: 0,
+                        ack_num: 0,
+                        payload: vec![],
+                    };
+                    let _ = socket.send_to(&pkt.encode(), peer_udp).await;
+                    mgr.mark_ping_sent(now);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if should_ping {
+                let keepalive_failed = stream_mgr.lock().await.keepalive_failed();
+                if keepalive_failed {
+                    tracing::error!(peer = %peer_udp, "keepalive failed, disconnecting");
+                    break;
+                }
             }
             next_ping = now + Duration::from_secs(1);
         }
 
         // Retransmit
         if now >= next_rtx {
-            for (_, pkt) in stream_mgr.retransmit_due(now) {
+            let packets_to_resend = {
+                stream_mgr.lock().await.retransmit_due(now)
+            };
+            for (_, pkt) in packets_to_resend {
                 let _ = socket.send_to(&pkt.encode(), peer_udp).await;
             }
             next_rtx = now + Duration::from_millis(100);
@@ -334,6 +385,7 @@ mod multi_client_tests {
 
         let ping = Packet {
             flags: FLAG_PING,
+            connection_id: 0,
             stream_id: 0,
             seq_num: 0,
             ack_num: 0,

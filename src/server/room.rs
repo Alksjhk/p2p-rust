@@ -47,10 +47,6 @@ impl RoomManager {
         self.rooms.get(id)
     }
 
-    pub fn get_room_mut(&mut self, id: &str) -> Option<&mut Room> {
-        self.rooms.get_mut(id)
-    }
-
     pub fn add_client(&mut self, room_id: &str, addr: &str) -> Option<(String, String)> {
         let room = self.rooms.get_mut(room_id)?;
         let peer_id = format!(

@@ -1,7 +1,9 @@
 use crate::protocol::packet::{Packet, FLAG_DATA, FLAG_ACK, FLAG_RST};
+use crate::protocol::stream::StreamManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +48,9 @@ impl TcpConnectionManager {
         target_addr: String,
         udp_socket: Arc<UdpSocket>,
         peer_addr: SocketAddr,
+        _current_acks: Arc<Mutex<HashMap<u16, u64>>>,
+        stream_mgr: Arc<Mutex<StreamManager>>,
+        connection_id: u64,
     ) {
         let writers = self.tcp_writers.clone();
         let udp_socket2 = udp_socket.clone();
@@ -80,8 +85,9 @@ impl TcpConnectionManager {
                 });
 
                 // TCP → UDP: read from TCP socket, send as DATA packets over UDP
+                let stream_mgr_clone = stream_mgr.clone();
+                let conn_id = connection_id;
                 let tcp_reader = tokio::spawn(async move {
-                    let mut seq: u16 = 0;
                     loop {
                         let mut buf = vec![0u8; 1400];
                         match tokio::time::timeout(
@@ -91,14 +97,25 @@ impl TcpConnectionManager {
                             Ok(Ok(0)) | Ok(Err(_)) => break,
                             Ok(Ok(n)) => {
                                 buf.truncate(n);
+
+                                // Use stream_mgr to get sequence number and ACK number
+                                let (seq, ack_num) = {
+                                    let mut mgr = stream_mgr_clone.lock().await;
+                                    let seq = mgr.next_send_seq(stream_id).unwrap_or(0);
+                                    let ack_num = mgr.current_ack(stream_id);
+                                    mgr.record_send(stream_id, seq, buf.clone(), Instant::now());
+                                    (seq, ack_num)
+                                };
+
                                 let pkt = Packet {
                                     flags: FLAG_DATA | FLAG_ACK,
+                                    connection_id: conn_id,
                                     stream_id,
                                     seq_num: seq,
-                                    ack_num: 0,
+                                    ack_num,
                                     payload: buf,
                                 };
-                                seq = seq.wrapping_add(1);
+
                                 if udp_socket2.send_to(&pkt.encode(), peer_addr).await.is_err() { break; }
                             }
                             _ => {} // timeout, loop again
@@ -114,6 +131,7 @@ impl TcpConnectionManager {
                 self.take_pending(stream_id).await;
                 let rst = Packet {
                     flags: FLAG_RST,
+                    connection_id: 0,
                     stream_id,
                     seq_num: 0,
                     ack_num: 0,

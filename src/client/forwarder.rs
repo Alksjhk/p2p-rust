@@ -1,7 +1,9 @@
 use crate::protocol::packet::{Packet, FLAG_SYN, FLAG_DATA, FLAG_ACK, FLAG_FIN};
+use crate::protocol::stream::StreamManager;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
@@ -12,6 +14,9 @@ pub async fn listen_and_forward(
     udp_socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     tcp_writers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+    _current_acks: Arc<Mutex<HashMap<u16, u64>>>,
+    stream_mgr: Arc<Mutex<StreamManager>>,
+    connection_id: u64,
 ) {
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", local_port)).await {
         Ok(l) => l,
@@ -22,8 +27,6 @@ pub async fn listen_and_forward(
     };
     tracing::info!(port = local_port, "listening for local connections");
 
-    let mut next_stream_id: u16 = 1;
-
     loop {
         let (tcp, addr) = match listener.accept().await {
             Ok(conn) => conn,
@@ -33,15 +36,25 @@ pub async fn listen_and_forward(
             }
         };
 
-        tracing::info!(peer = %addr, stream = next_stream_id, "new local connection");
-        let sid = next_stream_id;
-        next_stream_id = next_stream_id.wrapping_add(1);
         let writers = tcp_writers.clone();
         let socket = udp_socket.clone();
+        let stream_mgr_clone = stream_mgr.clone();
+        let tcp_clone = tcp;
 
         tokio::spawn(async move {
+            // Allocate stream in stream_mgr before sending SYN
+            let (sid, seq) = {
+                let mut mgr = stream_mgr_clone.lock().await;
+                let sid = mgr.allocate(Instant::now());
+                let seq = mgr.next_send_seq(sid).unwrap_or(0);
+                mgr.record_send(sid, seq, vec![], Instant::now());
+                (sid, seq)
+            };
+
+            tracing::info!(peer = %addr, stream = sid, "new local connection");
+
             // Send SYN directly over UDP
-            let syn = Packet { flags: FLAG_SYN, stream_id: sid, seq_num: 0, ack_num: 0, payload: vec![] };
+            let syn = Packet { flags: FLAG_SYN, connection_id, stream_id: sid, seq_num: seq, ack_num: 0, payload: vec![] };
             if socket.send_to(&syn.encode(), peer_addr).await.is_err() {
                 return;
             }
@@ -50,12 +63,11 @@ pub async fn listen_and_forward(
             let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
             writers.lock().await.insert(sid, tx);
 
-            let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
+            let (mut tcp_rx, mut tcp_tx) = tcp_clone.into_split();
 
-            // TCP -> UDP: reader task.  Send data directly over UDP.
+            // TCP -> UDP: reader task.  Send data with ACK numbers.
             let udp_socket2 = socket.clone();
             let tcp_reader = tokio::spawn(async move {
-                let mut seq: u16 = 1;
                 loop {
                     let mut buf = vec![0u8; 1400];
                     match tokio::time::timeout(
@@ -67,14 +79,22 @@ pub async fn listen_and_forward(
                         Ok(Ok(0)) | Ok(Err(_)) => break,
                         Ok(Ok(n)) => {
                             buf.truncate(n);
+                            // Get current ACK number for this stream
+                            let (seq, ack_num) = {
+                                let mut mgr = stream_mgr_clone.lock().await;
+                                let seq = mgr.next_send_seq(sid).unwrap_or(0);
+                                let ack_num = mgr.current_ack(sid);
+                                mgr.record_send(sid, seq, buf.clone(), Instant::now());
+                                (seq, ack_num)
+                            };
                             let pkt = Packet {
                                 flags: FLAG_DATA | FLAG_ACK,
+                                connection_id,
                                 stream_id: sid,
                                 seq_num: seq,
-                                ack_num: 0,
+                                ack_num,
                                 payload: buf,
                             };
-                            seq = seq.wrapping_add(1);
                             if udp_socket2.send_to(&pkt.encode(), peer_addr).await.is_err() {
                                 break;
                             }
@@ -98,7 +118,7 @@ pub async fn listen_and_forward(
             let _ = tokio::join!(tcp_reader, tcp_writer);
 
             // Send FIN directly over UDP
-            let fin = Packet { flags: FLAG_FIN, stream_id: sid, seq_num: 0, ack_num: 0, payload: vec![] };
+            let fin = Packet { flags: FLAG_FIN, connection_id, stream_id: sid, seq_num: 0, ack_num: 0, payload: vec![] };
             let _ = socket.send_to(&fin.encode(), peer_addr).await;
         });
     }

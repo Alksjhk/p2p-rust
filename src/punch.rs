@@ -31,6 +31,7 @@ pub async fn punch_hole(
     // Build probe packet
     let probe = Packet {
         flags: FLAG_PING,
+        connection_id: 0,
         stream_id: packet::CONTROL_STREAM,
         seq_num: 0,
         ack_num: 0,
@@ -74,6 +75,7 @@ mod tests {
     fn test_probe_packet_format() {
         let p = Packet {
             flags: FLAG_PING,
+            connection_id: 0,
             stream_id: 0,
             seq_num: 0,
             ack_num: 0,

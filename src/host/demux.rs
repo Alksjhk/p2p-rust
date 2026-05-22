@@ -86,6 +86,7 @@ mod tests {
         // Send a packet from client address
         let pkt = Packet {
             flags: FLAG_DATA,
+            connection_id: 0,
             stream_id: 1,
             seq_num: 0,
             ack_num: 0,

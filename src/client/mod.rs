@@ -63,6 +63,15 @@ pub async fn run(server_addr: String, room_id: String, local_port: u16, _secret:
         .ok();
     let _ = punch_handle.await;
 
+    // Generate connection_id
+    let connection_id = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        duration.as_secs() * 1_000_000_000 + duration.subsec_nanos() as u64
+    };
+
     // Notify server we're ready
     writer
         .send(&SignalMsg::P2PReady {
@@ -72,17 +81,23 @@ pub async fn run(server_addr: String, room_id: String, local_port: u16, _secret:
         .await?;
 
     // 5. Set up stream manager and packet channels
-    let mut stream_mgr = StreamManager::new(Instant::now());
+    let stream_mgr = StreamManager::new(Instant::now());
+    let stream_mgr_shared = Arc::new(Mutex::new(stream_mgr));
     let (packet_tx, mut packet_rx) = mpsc::unbounded_channel::<Packet>();
     let tcp_writers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Shared state for current ACK numbers (stream_id -> ack_num)
+    let current_acks: Arc<Mutex<HashMap<u16, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Start local port forwarder
     let fwd_socket = socket.clone();
     let fwd_peer = host_udp;
     let fwd_writers = tcp_writers.clone();
+    let fwd_acks = current_acks.clone();
+    let fwd_stream_mgr = stream_mgr_shared.clone();
     tokio::spawn(async move {
-        forwarder::listen_and_forward(local_port, fwd_socket, fwd_peer, fwd_writers).await;
+        forwarder::listen_and_forward(local_port, fwd_socket, fwd_peer, fwd_writers, fwd_acks, fwd_stream_mgr, connection_id).await;
     });
 
     // UDP receive task
@@ -111,29 +126,40 @@ pub async fn run(server_addr: String, room_id: String, local_port: u16, _secret:
     loop {
         let now = Instant::now();
 
-        // Keepalive
+        // Keepalive (only check at intervals)
         if now >= next_ping {
-            if stream_mgr.should_send_ping(now) {
-                let pkt = Packet {
-                    flags: FLAG_PING,
-                    stream_id: packet::CONTROL_STREAM,
-                    seq_num: 0,
-                    ack_num: 0,
-                    payload: vec![],
-                };
-                let _ = socket.send_to(&pkt.encode(), host_udp).await;
-                stream_mgr.mark_ping_sent(now);
-            }
-            if stream_mgr.keepalive_failed() {
+            let should_ping = {
+                let mut mgr = stream_mgr_shared.lock().await;
+                if mgr.should_send_ping(now) {
+                    let pkt = Packet {
+                        flags: FLAG_PING,
+                        connection_id,
+                        stream_id: packet::CONTROL_STREAM,
+                        seq_num: 0,
+                        ack_num: 0,
+                        payload: vec![],
+                    };
+                    let _ = socket.send_to(&pkt.encode(), host_udp).await;
+                    mgr.mark_ping_sent(now);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_ping && stream_mgr_shared.lock().await.keepalive_failed() {
                 tracing::error!("keepalive failed");
                 break;
             }
             next_ping = now + Duration::from_secs(1);
         }
 
-        // Retransmit
+        // Retransmit (only check at intervals)
         if now >= next_rtx {
-            for (_, pkt) in stream_mgr.retransmit_due(now) {
+            let retransmits = {
+                let mut mgr = stream_mgr_shared.lock().await;
+                mgr.retransmit_due(now)
+            };
+            for (_, pkt) in retransmits {
                 let _ = socket.send_to(&pkt.encode(), host_udp).await;
             }
             next_rtx = now + Duration::from_millis(100);
@@ -144,40 +170,64 @@ pub async fn run(server_addr: String, room_id: String, local_port: u16, _secret:
             tokio::time::timeout(Duration::from_millis(50), packet_rx.recv()).await
         {
             let now = Instant::now();
-            stream_mgr.last_activity = now;
-            if pkt.has_flag(FLAG_DATA) {
-                stream_mgr.on_data(pkt.stream_id, pkt.seq_num);
-                stream_mgr.on_ack(pkt.stream_id, pkt.ack_num);
+            let payloads = {
+                let mut mgr = stream_mgr_shared.lock().await;
+                mgr.last_activity = now;
+                if pkt.has_flag(FLAG_DATA) {
+                    let payloads = mgr.on_data(pkt.stream_id, pkt.seq_num, pkt.payload);
+                    mgr.on_ack(pkt.stream_id, pkt.ack_num);
+
+                    // Update shared ACK state for the forwarder
+                    let ack_num = mgr.current_ack(pkt.stream_id);
+                    current_acks.lock().await.insert(pkt.stream_id, ack_num);
+                    payloads
+                } else if pkt.has_flag(FLAG_SYN) {
+                    // Host-initiated SYN (future use): accept and send ACK
+                    let sid = mgr.accept_syn(pkt.stream_id, pkt.seq_num, now);
+                    let ack = Packet {
+                        flags: FLAG_ACK,
+                        connection_id,
+                        stream_id: sid,
+                        seq_num: 0,
+                        ack_num: pkt.seq_num.wrapping_add(1),
+                        payload: vec![],
+                    };
+                    let _ = socket.send_to(&ack.encode(), host_udp).await;
+                    vec![]
+                } else if pkt.has_flag(FLAG_ACK) {
+                    mgr.on_ack(pkt.stream_id, pkt.ack_num);
+                    vec![]
+                } else if pkt.has_flag(FLAG_PING) {
+                    let pong = Packet {
+                        flags: FLAG_PONG,
+                        connection_id,
+                        stream_id: packet::CONTROL_STREAM,
+                        seq_num: 0,
+                        ack_num: 0,
+                        payload: vec![],
+                    };
+                    let _ = socket.send_to(&pong.encode(), host_udp).await;
+                    mgr.on_pong();
+                    vec![]
+                } else if pkt.has_flag(FLAG_PONG) {
+                    mgr.on_pong();
+                    vec![]
+                } else if pkt.has_flag(FLAG_FIN) || pkt.has_flag(FLAG_RST) {
+                    mgr.remove(pkt.stream_id);
+                    vec![]
+                } else {
+                    vec![]
+                }
+            };
+
+            // Deliver payloads to TCP writers
+            if !payloads.is_empty() {
                 let writers = tcp_writers.lock().await;
                 if let Some(tx) = writers.get(&pkt.stream_id) {
-                    let _ = tx.send(pkt.payload.clone());
+                    for payload in payloads {
+                        let _ = tx.send(payload);
+                    }
                 }
-            } else if pkt.has_flag(FLAG_SYN) {
-                // Host-initiated SYN (future use): accept and send ACK
-                let sid = stream_mgr.accept_syn(pkt.stream_id, pkt.seq_num, now);
-                let ack = Packet {
-                    flags: FLAG_ACK,
-                    stream_id: sid,
-                    seq_num: 0,
-                    ack_num: pkt.seq_num.wrapping_add(1),
-                    payload: vec![],
-                };
-                let _ = socket.send_to(&ack.encode(), host_udp).await;
-            } else if pkt.has_flag(FLAG_ACK) {
-                stream_mgr.on_ack(pkt.stream_id, pkt.ack_num);
-            } else if pkt.has_flag(FLAG_PING) {
-                let pong = Packet {
-                    flags: FLAG_PONG,
-                    stream_id: packet::CONTROL_STREAM,
-                    seq_num: 0,
-                    ack_num: 0,
-                    payload: vec![],
-                };
-                let _ = socket.send_to(&pong.encode(), host_udp).await;
-            } else if pkt.has_flag(FLAG_PONG) {
-                stream_mgr.on_pong();
-            } else if pkt.has_flag(FLAG_FIN) || pkt.has_flag(FLAG_RST) {
-                stream_mgr.remove(pkt.stream_id);
             }
         }
 

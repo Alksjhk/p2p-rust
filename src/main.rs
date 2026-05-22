@@ -1,7 +1,6 @@
 mod config;
 mod signal;
 mod protocol;
-mod crypto;
 mod server;
 mod host;
 mod client;
